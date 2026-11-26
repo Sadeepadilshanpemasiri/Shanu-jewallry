@@ -1,0 +1,151 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isOwner() {
+      return request.auth != null
+        && get(/databases/$(database)/documents/access/owner).data.uid == request.auth.uid;
+    }
+
+    function validBalance(quantity) {
+      return quantity is int && quantity >= 0 && quantity <= 1000000;
+    }
+
+    function hasMovement(id, oldBalance) {
+      let movementId = request.resource.data.get('lastMovementId', '');
+      let path = /databases/$(database)/documents/stock_movements/$(movementId);
+      let movement = getAfter(path).data;
+      return !exists(path) && movement.productId == id
+        && movement.balance == request.resource.data.stockQty
+        && movement.qty == movement.balance - oldBalance;
+    }
+
+    match /access/owner {
+      allow get: if request.auth != null && resource.data.uid == request.auth.uid;
+    }
+
+    match /products/{id} {
+      function validArchiveAction() {
+        let actionId = request.resource.data.get('lastArchiveAction', '');
+        let path = /databases/$(database)/documents/inventory_activity/$(actionId);
+        let action = getAfter(path).data;
+        return actionId != '' && !exists(path) && action.productId == id
+          && request.resource.data.isActive is bool
+          && action.archived == !request.resource.data.isActive;
+      }
+      allow read: if isOwner();
+      allow create: if isOwner() && validBalance(request.resource.data.stockQty)
+        && ((request.resource.data.stockQty == 0 && !('lastMovementId' in request.resource.data)) || hasMovement(id, 0));
+      allow update: if isOwner() && validBalance(request.resource.data.stockQty)
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['isActive', 'lastArchiveAction'])
+          || (request.resource.data.isActive != resource.data.isActive && validArchiveAction()))
+        && ((request.resource.data.stockQty == resource.data.stockQty && request.resource.data.get('lastMovementId', '') == resource.data.get('lastMovementId', ''))
+          || hasMovement(id, resource.data.stockQty));
+    }
+
+    match /inventory_activity/{id} {
+      function matchesArchiveChange() {
+        let productId = request.resource.data.productId;
+        let path = /databases/$(database)/documents/products/$(productId);
+        let before = get(path).data;
+        let after = getAfter(path).data;
+        return after.lastArchiveAction == id && before.isActive != after.isActive
+          && after.isActive == !request.resource.data.archived
+          && after.name == request.resource.data.productName;
+      }
+      allow read: if isOwner();
+      allow create: if isOwner() && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.archived is bool && matchesArchiveChange();
+    }
+
+    match /stock_movements/{id} {
+      function matchesProduct() {
+        let productId = request.resource.data.productId;
+        let path = /databases/$(database)/documents/products/$(productId);
+        let product = getAfter(path).data;
+        return product.lastMovementId == id && product.stockQty == request.resource.data.balance;
+      }
+      allow read: if isOwner();
+      allow create: if isOwner()
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.qty is int && request.resource.data.qty != 0
+        && validBalance(request.resource.data.balance)
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() > 0 && request.resource.data.reason.size() <= 250
+        && request.resource.data.type in ['stockIn', 'stockOut', 'adjustment', 'returned']
+        && (request.resource.data.type == 'adjustment'
+          || (request.resource.data.type == 'stockOut' && request.resource.data.qty < 0)
+          || (request.resource.data.type in ['stockIn', 'returned'] && request.resource.data.qty > 0))
+        && matchesProduct();
+    }
+
+    match /orders/{id} {
+      function hasWaybill() {
+        let key = request.resource.data.waybillKey;
+        return key is string && request.resource.data.courier is string
+          && request.resource.data.trackingId is string
+          && request.resource.data.trackingId.size() > 0
+          && getAfter(/databases/$(database)/documents/waybills/$(key)).data.orderId == id;
+      }
+      allow read, delete: if isOwner();
+      allow create: if isOwner() && request.resource.data.status != 'shipped';
+      allow update: if isOwner() && (request.resource.data.status != 'shipped'
+        || (resource.data.status == 'shipped'
+          && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['courier', 'trackingId', 'waybillKey']))
+        || hasWaybill());
+    }
+
+    match /waybills/{id} {
+      function assignedToOrder() {
+        let orderId = request.resource.data.orderId;
+        let order = getAfter(/databases/$(database)/documents/orders/$(orderId)).data;
+        return order.status == 'shipped' && order.waybillKey == id;
+      }
+      allow read: if isOwner();
+      allow create: if isOwner()
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.courierKey is string
+        && request.resource.data.trackingNormalized is string
+        && assignedToOrder();
+    }
+
+    match /notifications/{id} {
+      function sameState() {
+        return request.resource.data.state == resource.data.state
+          && request.resource.data.snoozedUntil == resource.data.snoozedUntil;
+      }
+      function ownerAction() {
+        return resource.data.state in ['open', 'snoozed']
+          && ((request.resource.data.state == 'done' && request.resource.data.snoozedUntil == null)
+            || (request.resource.data.state == 'snoozed'
+              && request.resource.data.snoozedUntil is timestamp
+              && request.resource.data.snoozedUntil > request.time
+              && request.resource.data.snoozedUntil <= request.time + duration.value(7, 'd')));
+      }
+      allow read: if isOwner();
+      allow update: if isOwner()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead', 'state', 'snoozedUntil'])
+        && request.resource.data.isRead == true && (sameState() || ownerAction());
+    }
+
+    match /push_devices/{id} {
+      function validDevice() {
+        return id.matches('^[a-f0-9]{32}$')
+          && request.resource.data.keys().hasOnly(['uid', 'token', 'updatedAt'])
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.token is string
+          && request.resource.data.token.size() > 0 && request.resource.data.token.size() <= 4096
+          && request.resource.data.updatedAt == request.time;
+      }
+      allow get: if isOwner() && (resource == null || resource.data.uid == request.auth.uid);
+      allow create: if isOwner() && validDevice();
+      allow update: if isOwner() && resource.data.uid == request.auth.uid && validDevice();
+      allow delete: if isOwner() && (resource == null || resource.data.uid == request.auth.uid);
+    }
+
+    match /{collection}/{document=**} {
+      allow read, write: if !(collection in ['access', 'products', 'stock_movements', 'orders', 'waybills', 'notifications', 'push_devices', 'inventory_activity']) && isOwner();
+    }
+  }
+}
